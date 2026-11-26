@@ -41,7 +41,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ket-bot")
 
 # ---------- база данных ----------
-db = sqlite3.connect(DB_PATH)
+def open_db():
+    """Открывает базу; если файл повреждён (не SQLite), переименовывает его и создаёт новую."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.DatabaseError:
+        conn.close()
+        broken = DB_PATH + ".broken"
+        try:
+            if os.path.exists(broken):
+                os.remove(broken)
+            os.replace(DB_PATH, broken)
+            log.warning("Файл %s не является базой данных, переименован в %s", DB_PATH, broken)
+        except OSError:
+            os.remove(DB_PATH)
+            log.warning("Файл %s не является базой данных, удалён", DB_PATH)
+        conn = sqlite3.connect(DB_PATH)
+    return conn
+
+
+db = open_db()
 db.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, grp TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS days (day TEXT PRIMARY KEY, version INTEGER, data TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS sent (chat_id INTEGER, day TEXT, hash TEXT, PRIMARY KEY(chat_id, day))")
