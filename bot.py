@@ -124,14 +124,23 @@ def menu_kb():
     ])
 
 
+SHORT_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
 def days_kb():
+    """Кнопки только для тех дней, на которые расписание есть (от сегодняшнего дня и позже)."""
     today = datetime.now(TZ).date()
     rows = []
-    for i, label in enumerate(("Сегодня", "Завтра", "Послезавтра")):
-        d = today + timedelta(days=i)
-        mark = "" if get_day(d) is not None else " (нет)"
-        rows.append([InlineKeyboardButton(text=f"{label} · {d:%d.%m}{mark}",
-                                          callback_data=f"d:{d.isoformat()}")])
+    for (iso,) in db.execute("SELECT day FROM days WHERE day>=? ORDER BY day LIMIT 10",
+                             (today.isoformat(),)).fetchall():
+        d = date.fromisoformat(iso)
+        if d == today:
+            label = f"Сегодня · {d:%d.%m}"
+        elif d == today + timedelta(days=1):
+            label = f"Завтра · {d:%d.%m}"
+        else:
+            label = f"{SHORT_DAYS[d.weekday()]} · {d:%d.%m}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"d:{iso}")])
     rows.append(back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -338,7 +347,11 @@ async def cb_sched(cb: CallbackQuery):
     if not get_group(cb.message.chat.id):
         await cb.answer("Сначала выберите группу: /group", show_alert=True)
         return
-    await cb.message.edit_text("<b>Расписание</b>\nВыберите день:", reply_markup=days_kb())
+    kb = days_kb()
+    if len(kb.inline_keyboard) == 1:  # есть только кнопка «В меню»
+        await cb.message.edit_text("Расписание пока не опубликовано.", reply_markup=kb)
+    else:
+        await cb.message.edit_text("<b>Расписание</b>\nВыберите день:", reply_markup=kb)
     await cb.answer()
 
 
