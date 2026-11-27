@@ -17,7 +17,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-                           KeyboardButton, Message, ReplyKeyboardMarkup)
+                           Message, ReplyKeyboardRemove)
 from dotenv import load_dotenv
 
 from schedule_parser import parse_file, parse_file_full
@@ -112,11 +112,28 @@ def format_day(group, d: date, data):
     return "\n".join(lines)
 
 
-MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра")],
-              [KeyboardButton(text="Звонки"), KeyboardButton(text="Преподаватели")],
-              [KeyboardButton(text="Сменить группу")]],
-    resize_keyboard=True)
+def back_row(to="m:menu", text="⬅️ В меню"):
+    return [InlineKeyboardButton(text=text, callback_data=to)]
+
+
+def menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Расписание", callback_data="m:sched")],
+        [InlineKeyboardButton(text="🔔 Звонки", callback_data="m:bells")],
+        [InlineKeyboardButton(text="👩‍🏫 Преподаватели", callback_data="m:teach")],
+    ])
+
+
+def days_kb():
+    today = datetime.now(TZ).date()
+    rows = []
+    for i, label in enumerate(("Сегодня", "Завтра", "Послезавтра")):
+        d = today + timedelta(days=i)
+        mark = "" if get_day(d) is not None else " (нет)"
+        rows.append([InlineKeyboardButton(text=f"{label} · {d:%d.%m}{mark}",
+                                          callback_data=f"d:{d.isoformat()}")])
+    rows.append(back_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def groups_keyboard():
@@ -229,49 +246,7 @@ async def watcher(bot: Bot):
 
 # ---------- обработчики ----------
 dp = Dispatcher()
-
-
-async def ask_group(message: Message, bot: Bot):
-    if not all_groups():
-        await message.answer("Пока нет данных о группах. Отправьте мне файл расписания "
-                             "(PDF или xlsx) — я его разберу и покажу список групп.")
-        return
-    await message.answer("Выберите свою группу:", reply_markup=groups_keyboard())
-
-
-@dp.message(CommandStart())
-@dp.message(Command("group"))
-@dp.message(F.text == "Сменить группу")
-async def on_start(message: Message, bot: Bot):
-    await ask_group(message, bot)
-
-
-@dp.callback_query(F.data.startswith("g:"))
-async def on_group_chosen(cb: CallbackQuery):
-    grp = cb.data[2:]
-    set_group(cb.from_user.id, grp)
-    await cb.message.edit_text(f"Группа сохранена: <b>{html.escape(grp)}</b>")
-    await cb.message.answer("Готово! Теперь расписание вашей группы будет приходить само: "
-                            "каждый вечер на завтра и при любых изменениях.", reply_markup=MENU)
-    today = datetime.now(TZ).date()
-    for d in (today, today + timedelta(days=1)):
-        data = get_day(d)
-        if data is not None and grp in data:
-            await cb.message.answer(format_day(grp, d, data))
-    await cb.answer()
-
-
-async def show_day(message: Message, d: date):
-    grp = get_group(message.chat.id)
-    if not grp:
-        await message.answer("Сначала выберите группу: /group")
-        return
-    data = get_day(d)
-    if data is None:
-        await message.answer(f"Расписание на {WEEKDAYS[d.weekday()]}, {d:%d.%m} пока не опубликовано на сайте.")
-        return
-    await message.answer(format_day(grp, d, data))
-
+awaiting_teacher = set()  # чаты, где бот ждёт имя преподавателя
 
 BELLS = (
     "🔔 <b>Расписание звонков</b>\n\n"
@@ -291,40 +266,137 @@ BELLS = (
 )
 
 
+async def ask_group(message: Message, bot: Bot):
+    if not all_groups():
+        await message.answer("Пока нет данных о группах. Отправьте мне файл расписания "
+                             "(PDF или xlsx) — я его разберу и покажу список групп.")
+        return
+    await message.answer("Выберите свою группу:", reply_markup=groups_keyboard())
+
+
+async def clear_old_keyboard(message: Message):
+    """Убирает кнопки внизу экрана, которые остались от старой версии бота."""
+    try:
+        m = await message.answer("…", reply_markup=ReplyKeyboardRemove())
+        await m.delete()
+    except Exception:
+        pass
+
+
+async def show_menu(message: Message):
+    awaiting_teacher.discard(message.chat.id)
+    grp = get_group(message.chat.id)
+    text = "<b>Меню</b>"
+    if grp:
+        text += f"\nВаша группа: <b>{html.escape(grp)}</b> (сменить: /group)"
+    await message.answer(text, reply_markup=menu_kb())
+
+
+@dp.message(CommandStart())
+async def on_start(message: Message, bot: Bot):
+    await clear_old_keyboard(message)
+    if get_group(message.chat.id):
+        await show_menu(message)
+    else:
+        await ask_group(message, bot)
+
+
+@dp.message(Command("group"))
+async def on_group(message: Message, bot: Bot):
+    await clear_old_keyboard(message)
+    await ask_group(message, bot)
+
+
+@dp.message(Command("menu"))
+async def on_menu(message: Message):
+    await clear_old_keyboard(message)
+    await show_menu(message)
+
+
+@dp.callback_query(F.data.startswith("g:"))
+async def on_group_chosen(cb: CallbackQuery):
+    grp = cb.data[2:]
+    set_group(cb.from_user.id, grp)
+    await cb.message.edit_text(f"Группа сохранена: <b>{html.escape(grp)}</b>\n"
+                               "Расписание будет приходить само: каждый вечер на завтра "
+                               "и при любых изменениях.")
+    await show_menu(cb.message)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "m:menu")
+async def cb_menu(cb: CallbackQuery):
+    awaiting_teacher.discard(cb.message.chat.id)
+    grp = get_group(cb.message.chat.id)
+    text = "<b>Меню</b>" + (f"\nВаша группа: <b>{html.escape(grp)}</b> (сменить: /group)" if grp else "")
+    await cb.message.edit_text(text, reply_markup=menu_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "m:sched")
+async def cb_sched(cb: CallbackQuery):
+    if not get_group(cb.message.chat.id):
+        await cb.answer("Сначала выберите группу: /group", show_alert=True)
+        return
+    await cb.message.edit_text("<b>Расписание</b>\nВыберите день:", reply_markup=days_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("d:"))
+async def cb_day(cb: CallbackQuery):
+    d = date.fromisoformat(cb.data[2:])
+    grp = get_group(cb.message.chat.id)
+    if not grp:
+        await cb.answer("Сначала выберите группу: /group", show_alert=True)
+        return
+    data = get_day(d)
+    if data is None:
+        await cb.answer(f"Расписание на {d:%d.%m} пока не опубликовано.", show_alert=True)
+        return
+    await cb.message.answer(format_day(grp, d, data))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "m:bells")
+async def cb_bells(cb: CallbackQuery):
+    await cb.message.answer(BELLS)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "m:teach")
+async def cb_teach(cb: CallbackQuery):
+    awaiting_teacher.add(cb.message.chat.id)
+    await cb.message.answer("Напишите имя, фамилию или отчество преподавателя, например: <i>Юлия</i>.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_row()]))
+    await cb.answer()
+
+
+# старые команды продолжают работать
 @dp.message(Command("bells"))
-@dp.message(F.text == "Звонки")
 async def on_bells(message: Message):
     await message.answer(BELLS)
 
 
+async def show_day(message: Message, d: date):
+    grp = get_group(message.chat.id)
+    if not grp:
+        await message.answer("Сначала выберите группу: /group")
+        return
+    data = get_day(d)
+    if data is None:
+        await message.answer(f"Расписание на {WEEKDAYS[d.weekday()]}, {d:%d.%m} пока не опубликовано на сайте.")
+        return
+    await message.answer(format_day(grp, d, data))
+
+
 @dp.message(Command("today"))
-@dp.message(F.text == "Сегодня")
 async def on_today(message: Message):
     await show_day(message, datetime.now(TZ).date())
 
 
 @dp.message(Command("tomorrow"))
-@dp.message(F.text == "Завтра")
 async def on_tomorrow(message: Message):
     await show_day(message, datetime.now(TZ).date() + timedelta(days=1))
-
-
-@dp.message(Command("week"))
-async def on_week(message: Message):
-    grp = get_group(message.chat.id)
-    if not grp:
-        await message.answer("Сначала выберите группу: /group")
-        return
-    today = datetime.now(TZ).date()
-    found = False
-    for i in range(7):
-        d = today + timedelta(days=i)
-        data = get_day(d)
-        if data is not None:
-            found = True
-            await message.answer(format_day(grp, d, data))
-    if not found:
-        await message.answer("На ближайшие дни расписание пока не опубликовано.")
 
 
 @dp.message(F.document)
@@ -378,6 +450,11 @@ async def send_long(message: Message, lines):
         await message.answer(chunk)
 
 
+@dp.message(Command("myid"))
+async def on_myid(message: Message):
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
+
 @dp.message(Command("status"))
 async def on_status(message: Message):
     days = [r[0] for r in db.execute("SELECT day FROM days ORDER BY day DESC LIMIT 3")]
@@ -387,32 +464,46 @@ async def on_status(message: Message):
              f"Ошибка сайта: {sync_state['error']}" if sync_state["error"] else "Ошибок нет",
              "Последние дни в базе: " + (", ".join(days) if days else "нет"),
              f"Пользователей с группой: {users}",
-             f"Рассылка на завтра: каждый день в {SEND_TIME} (Кострома)"]
+             f"Рассылка на завтра: каждый день в {SEND_TIME} (Кострома)",
+             "Загрузка файлов: только владелец" if ADMIN_ID else "Загрузка файлов: ДОСТУПНА ВСЕМ (ADMIN_ID не задан)"]
     await message.answer("\n".join(html.escape(l) for l in lines))
 
 
+def norm(t: str) -> str:
+    return t.lower().replace("ё", "е")
+
+
 @dp.message(Command("teachers"))
-@dp.message(F.text == "Преподаватели")
 async def on_teachers(message: Message):
+    awaiting_teacher.add(message.chat.id)
+    await message.answer("Напишите имя, фамилию или отчество преподавателя, например: <i>Юлия</i>.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_row()]))
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_text(message: Message):
+    if message.chat.id not in awaiting_teacher:
+        await message.answer("Откройте меню: /menu")
+        return
     teachers = load_teachers()
     if not teachers:
         await message.answer("Список преподавателей пока пуст. Владелец бота может добавить "
                              "имена в файл teachers.txt.")
         return
-    await message.answer("👩‍🏫 <b>Преподаватели</b>\nЧтобы найти человека, просто напишите его фамилию.")
-    await send_long(message, [html.escape(t) for t in teachers])
-
-
-@dp.message(F.text & ~F.text.startswith("/"))
-async def on_text_search(message: Message):
-    q = message.text.strip().lower().replace("ё", "е")
-    if len(q) < 3:
+    words = [w for w in norm(message.text).split() if len(w) >= 2]
+    if not words:
+        await message.answer("Напишите хотя бы две буквы имени, фамилии или отчества.")
         return
-    found = [t for t in load_teachers() if q in t.lower().replace("ё", "е")]
-    if found:
-        await send_long(message, [html.escape(t) for t in found[:30]])
-    else:
-        await message.answer("Никого не нашёл. Попробуйте написать только фамилию.")
+    found = [t for t in teachers if all(w in norm(t) for w in words)]
+    kb = InlineKeyboardMarkup(inline_keyboard=[back_row()])
+    if not found:
+        await message.answer("Никого не нашёл. Попробуйте написать только фамилию или только имя.",
+                             reply_markup=kb)
+        return
+    await send_long(message, [html.escape(t) for t in found[:30]])
+    if len(found) > 30:
+        await message.answer("Найдено больше 30 человек, уточните запрос.")
+    await message.answer("Можно написать ещё одно имя или вернуться в меню.", reply_markup=kb)
 
 
 async def main():
